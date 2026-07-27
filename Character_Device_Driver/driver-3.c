@@ -70,6 +70,21 @@ static const char kbd_map[2][128] = {
 	},
 };
 
+// Numeric keypad. Kept out of kbd_map because these must not follow shift --
+// keypad 7 is '7', never '&'. Digits and '.' are Num Lock functions; '-' and
+// '+' work either way, as does keypad '*' (0x37, outside this range, so it
+// stays in kbd_map above).
+#define KP_FIRST 0x47
+#define KP_LAST  0x53
+static const char kbd_keypad[KP_LAST - KP_FIRST + 1] = {
+	[0x47 - KP_FIRST] = '7', [0x48 - KP_FIRST] = '8', [0x49 - KP_FIRST] = '9',
+	[0x4a - KP_FIRST] = '-',
+	[0x4b - KP_FIRST] = '4', [0x4c - KP_FIRST] = '5', [0x4d - KP_FIRST] = '6',
+	[0x4e - KP_FIRST] = '+',
+	[0x4f - KP_FIRST] = '1', [0x50 - KP_FIRST] = '2', [0x51 - KP_FIRST] = '3',
+	[0x52 - KP_FIRST] = '0', [0x53 - KP_FIRST] = '.',
+};
+
 static int major;
 static struct class *kbd_class;
 static atomic_t opens = ATOMIC_INIT(0);
@@ -110,6 +125,7 @@ static void ring_push(char c)
 static void kbd_decode(u8 sc)
 {
 	static bool shift, caps, ext;
+	static bool num = true;			// most BIOSes enable Num Lock at boot
 	static int pause_left;
 	unsigned char code = sc & 0x7f;
 	bool release = sc & 0x80;
@@ -144,8 +160,21 @@ static void kbd_decode(u8 sc)
 		caps ^= !release;
 		return;
 	}
+	if (code == 0x45) {			// num lock, toggle on press edge
+		num ^= !release;
+		return;
+	}
 	if (release)
 		return;
+
+	if (code >= KP_FIRST && code <= KP_LAST) {
+		c = kbd_keypad[code - KP_FIRST];
+		// Without Num Lock these keys are Home/arrows/PgUp/Del, which we
+		// have no character for -- drop them rather than emit a digit.
+		if (c && (num || c == '-' || c == '+'))
+			ring_push(c);
+		return;
+	}
 
 	c = kbd_map[shift][code];
 	if (!c)

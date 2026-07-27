@@ -1,239 +1,327 @@
-// Macros used to mark up functions e.g. __init __exit
-#include <linux/init.h>
+// ps2kbd - PS/2 keyboard char driver. Claims IRQ 1 and the i8042 data port,
+// decodes scancode set 1 (US layout) and serves the characters via /dev/ps2kbd.
+//
+// The built-in i8042 driver owns those resources, so request_irq() returns
+// -EBUSY until you `make unbind`. That kills your PS/2 keyboard until
+// `make rebind`, so do it in a VM or over SSH.
 
- // Core header for loading LKMs into the kernel
-#include <linux/module.h> 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
- // Header to support the kernel Driver Model
-#include <linux/device.h> 
-
- // Contains types, macros, functions for the kernel
-#include <linux/kernel.h>
-
- // Header for the Linux file system support
+#include <linux/module.h>
 #include <linux/fs.h>
+#include <linux/device.h>
+#include <linux/uaccess.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/ioport.h>
+#include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/poll.h>
+#include <linux/ctype.h>
+#include <linux/version.h>
 
- // Required for the copy to user function
-#include <asm/uaccess.h>
+#define DEVICE_NAME "ps2kbd"
+#define KBD_IRQ     1
+#define KBD_DATA    0x60	// i8042 data port
+#define KBD_STATUS  0x64	// i8042 status port
+#define BUF_SIZE    256		// ring capacity, power of two
+#define READ_MAX    64		// cap on one read(), bounds the stack copy
 
-// The device will appear at /dev/char using this value
-#define  DEVICE_NAME "B_Driver_1"
-
-// The device class -- this is a character device driver
-#define  CLASS_NAME  "B_Driver"        
-
-// The license type -- this affects available functionality
 MODULE_LICENSE("GPL");
-
-// The author -- visible when you use modinfo
 MODULE_AUTHOR("Parth Basole");
+MODULE_DESCRIPTION("PS/2 keyboard driver: decodes scancodes from port 0x60 on IRQ 1");
+MODULE_VERSION("1.0");
 
-
-MODULE_DESCRIPTION(" Demo character driver");
-
-// A version number to inform users
-MODULE_VERSION("0.1");
-
-// Stores the device number -- determined automatically
-static int    majorNumber;
-
-// Memory for the string that is passed from userspace
-static char   message[256] = {0};       
-
-// Used to remember the size of the string stored
-static short  size_of_message;           
-
-// Counts the number of times the device is opened
-static int    numberOpens = 0;             
-
-// The device-driver class struct pointer
-static struct class*  charClass  = NULL;
- 
-static struct device* charDevice = NULL;  
-
-// The prototype functions for the character driver -- must come before the struct definition
-static int     dev_open(struct inode *, struct file *);
-
-static int     dev_release(struct inode *, struct file *);
-
-static ssize_t dev_read(struct file *, char *, size_t, loff_t *);
-
-static ssize_t dev_write(struct file *, const char *, size_t, loff_t *);
- 
-// Initialise file_operations structure
-inline void mywrite_cr0(unsigned long cr0) {
-  asm volatile("mov %0,%%cr0" : "+r"(cr0), "+m"(__force_order));
-}
-void enable_write_protection(void) {
-  unsigned long cr0 = read_cr0();
-  set_bit(16, &cr0);
-  mywrite_cr0(cr0);
-}
-
-void disable_write_protection(void) {
-  unsigned long cr0 = read_cr0();
-  clear_bit(16, &cr0);
-  mywrite_cr0(cr0);
-}
-static struct file_operations fops =
-{
-   .open = dev_open,
-   .read = dev_read,
-   .write = dev_write,
-   .release = dev_release,
+// US layout, scancode set 1 make codes: [0] plain, [1] shifted.
+static const char kbd_map[2][128] = {
+	{
+		[0x02] = '1',  [0x03] = '2', [0x04] = '3',  [0x05] = '4',
+		[0x06] = '5',  [0x07] = '6', [0x08] = '7',  [0x09] = '8',
+		[0x0a] = '9',  [0x0b] = '0', [0x0c] = '-',  [0x0d] = '=',
+		[0x0e] = '\b', [0x0f] = '\t',
+		[0x10] = 'q',  [0x11] = 'w', [0x12] = 'e',  [0x13] = 'r',
+		[0x14] = 't',  [0x15] = 'y', [0x16] = 'u',  [0x17] = 'i',
+		[0x18] = 'o',  [0x19] = 'p', [0x1a] = '[',  [0x1b] = ']',
+		[0x1c] = '\n',
+		[0x1e] = 'a',  [0x1f] = 's', [0x20] = 'd',  [0x21] = 'f',
+		[0x22] = 'g',  [0x23] = 'h', [0x24] = 'j',  [0x25] = 'k',
+		[0x26] = 'l',  [0x27] = ';', [0x28] = '\'', [0x29] = '`',
+		[0x2b] = '\\',
+		[0x2c] = 'z',  [0x2d] = 'x', [0x2e] = 'c',  [0x2f] = 'v',
+		[0x30] = 'b',  [0x31] = 'n', [0x32] = 'm',  [0x33] = ',',
+		[0x34] = '.',  [0x35] = '/', [0x37] = '*',  [0x39] = ' ',
+	},
+	{
+		[0x02] = '!',  [0x03] = '@', [0x04] = '#',  [0x05] = '$',
+		[0x06] = '%',  [0x07] = '^', [0x08] = '&',  [0x09] = '*',
+		[0x0a] = '(',  [0x0b] = ')', [0x0c] = '_',  [0x0d] = '+',
+		[0x0e] = '\b', [0x0f] = '\t',
+		[0x10] = 'Q',  [0x11] = 'W', [0x12] = 'E',  [0x13] = 'R',
+		[0x14] = 'T',  [0x15] = 'Y', [0x16] = 'U',  [0x17] = 'I',
+		[0x18] = 'O',  [0x19] = 'P', [0x1a] = '{',  [0x1b] = '}',
+		[0x1c] = '\n',
+		[0x1e] = 'A',  [0x1f] = 'S', [0x20] = 'D',  [0x21] = 'F',
+		[0x22] = 'G',  [0x23] = 'H', [0x24] = 'J',  [0x25] = 'K',
+		[0x26] = 'L',  [0x27] = ':', [0x28] = '"',  [0x29] = '~',
+		[0x2b] = '|',
+		[0x2c] = 'Z',  [0x2d] = 'X', [0x2e] = 'C',  [0x2f] = 'V',
+		[0x30] = 'B',  [0x31] = 'N', [0x32] = 'M',  [0x33] = '<',
+		[0x34] = '>',  [0x35] = '?', [0x37] = '*',  [0x39] = ' ',
+	},
 };
- 
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// Driver initialisation function
 
-static int __init char_init(void)
+// Numeric keypad. Kept out of kbd_map because these must not follow shift --
+// keypad 7 is '7', never '&'. Digits and '.' are Num Lock functions; '-' and
+// '+' work either way, as does keypad '*' (0x37, outside this range, so it
+// stays in kbd_map above).
+#define KP_FIRST 0x47
+#define KP_LAST  0x53
+static const char kbd_keypad[KP_LAST - KP_FIRST + 1] = {
+	[0x47 - KP_FIRST] = '7', [0x48 - KP_FIRST] = '8', [0x49 - KP_FIRST] = '9',
+	[0x4a - KP_FIRST] = '-',
+	[0x4b - KP_FIRST] = '4', [0x4c - KP_FIRST] = '5', [0x4d - KP_FIRST] = '6',
+	[0x4e - KP_FIRST] = '+',
+	[0x4f - KP_FIRST] = '1', [0x50 - KP_FIRST] = '2', [0x51 - KP_FIRST] = '3',
+	[0x52 - KP_FIRST] = '0', [0x53 - KP_FIRST] = '.',
+};
+
+static int major;
+static struct class *kbd_class;
+static atomic_t opens = ATOMIC_INIT(0);
+static bool got_data, got_status;	// which ports we actually reserved
+
+// Ring buffer: produced in hard IRQ, consumed by read().
+static char ring[BUF_SIZE];
+static unsigned int head, tail;
+static DEFINE_SPINLOCK(ring_lock);
+// Named kbd_waitq, not readq -- <linux/io.h> defines readq() as an MMIO accessor.
+static DECLARE_WAIT_QUEUE_HEAD(kbd_waitq);
+
+static bool ring_empty(void)
 {
-	printk(KERN_INFO "B : Driver loaded successfully\n");
-
-	//Allocate a major number for the device
-	majorNumber = register_chrdev(0, DEVICE_NAME, &fops);
-
-	// If there is a problem in major number allocation   
-	if (majorNumber<0)
-	{
-		printk(KERN_ALERT "B : failed to register a major number\n");
-
-		return majorNumber;
-	}
-
-	printk(KERN_INFO "B : registered correctly with major number %d\n", majorNumber);
-
-	// Register the device class
-	charClass = class_create(THIS_MODULE, CLASS_NAME);
-
-	if (IS_ERR(charClass))
-	{
-		unregister_chrdev(majorNumber, DEVICE_NAME);
-
-		printk(KERN_ALERT "Failed to register device class\n");
-
-		return PTR_ERR(charClass); 
-	}
-
-	printk(KERN_INFO "B : device class registered correctly\n");
-
-	// Register the device driver
-	charDevice = device_create(charClass, NULL, MKDEV(majorNumber, 0), NULL, DEVICE_NAME);
-
-	if (IS_ERR(charDevice))
-	{               // Clean up if there is an error
-		class_destroy(charClass); 
-
-		unregister_chrdev(majorNumber, DEVICE_NAME);
-
-		printk(KERN_ALERT "Failed to create the device\n");
-		return PTR_ERR(charDevice);
-	}
-
-	printk(KERN_INFO "B : device class created correctly\n");
-    disable_write_protection();
-	return 0;
-}
- //////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Driver cleanup function
-
-static void __exit char_exit(void)
-{
-	// remove the device
-	device_destroy(charClass, MKDEV(majorNumber, 0));
-
-	// unregister the device class
-	class_unregister(charClass);
-
-	// remove the device class
-	class_destroy(charClass); 
-
-	// unregister the major number
-	unregister_chrdev(majorNumber, DEVICE_NAME);
-    enable_write_protection();
-	printk(KERN_INFO "B : Goodbye from our driver!\n");
+	return READ_ONCE(head) == READ_ONCE(tail);
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////// 
-
-// Function which gets called when we open the device
-
-static int dev_open(struct inode *inodep, struct file *filep)
+static void ring_push(char c)
 {
-	numberOpens++;
+	unsigned int next;
+	unsigned long flags;
 
-	printk(KERN_INFO "B :  Device has been opened %d time(s)\n", numberOpens);
-
-	return 0;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////// 
-// Function is called whenever device is being read from user space i.e. data is
-
-/*
-filep :	A pointer to a file object (defined in linux/fs.h)
-buffer:	The pointer to the buffer to which this function writes the data
-len :	The length of the b
-offset:	The offset if required
-*/
-
-static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset)
-{
-	int error_count = 0;
-	// copy_to_user has the format ( * to, *from, size) and returns 0 on success
-	error_count = raw_copy_to_user(buffer, message, size_of_message);
-
-	if (error_count==0)
-	{            // if true then have success
-		printk(KERN_INFO "B :  Sent %d characters to the user\n", size_of_message);
-		
-		return (size_of_message=0);  // clear the position to the start and return 0
+	spin_lock_irqsave(&ring_lock, flags);
+	next = (head + 1) & (BUF_SIZE - 1);
+	if (next != tail) {		// full: drop, the reader is too slow
+		ring[head] = c;
+		head = next;
 	}
-	else 
-	{
-		printk(KERN_INFO "B :  Failed to send %d characters to the user\n", error_count);
+	spin_unlock_irqrestore(&ring_lock, flags);
 
-		return -EFAULT;              // Failed -- return a bad address message (i.e. -14)
+	wake_up_interruptible(&kbd_waitq);
+}
+
+// Decode one scancode. Multi-byte sequences (0xe0 extended, 0xe1 Pause) are
+// tracked across calls so their payload is never mistaken for a key -- that
+// matters because arrows and PrintScreen emit a fake shift (0xe0 0x2a) which
+// would otherwise invert our shift state for every subsequent keystroke.
+static void kbd_decode(u8 sc)
+{
+	static bool shift, caps, ext;
+	static bool num = true;			// most BIOSes enable Num Lock at boot
+	static int pause_left;
+	unsigned char code = sc & 0x7f;
+	bool release = sc & 0x80;
+	char c;
+
+	if (sc == 0xe1) {			// Pause: e1 1d 45 e1 9d c5
+		pause_left = 2;
+		return;
 	}
+	if (pause_left) {
+		pause_left--;
+		return;
+	}
+	if (sc == 0xe0) {
+		ext = true;
+		return;
+	}
+	if (ext) {				// extended: keypad, arrows, r-ctrl/alt
+		ext = false;
+		if (!release && code == 0x1c)
+			ring_push('\n');	// keypad Enter
+		else if (!release && code == 0x35)
+			ring_push('/');		// keypad /
+		return;
+	}
+
+	if (code == 0x2a || code == 0x36) {	// either shift
+		shift = !release;
+		return;
+	}
+	if (code == 0x3a) {			// caps lock, toggle on press edge
+		caps ^= !release;
+		return;
+	}
+	if (code == 0x45) {			// num lock, toggle on press edge
+		num ^= !release;
+		return;
+	}
+	if (release)
+		return;
+
+	if (code >= KP_FIRST && code <= KP_LAST) {
+		c = kbd_keypad[code - KP_FIRST];
+		// Without Num Lock these keys are Home/arrows/PgUp/Del, which we
+		// have no character for -- drop them rather than emit a digit.
+		if (c && (num || c == '-' || c == '+'))
+			ring_push(c);
+		return;
+	}
+
+	c = kbd_map[shift][code];
+	if (!c)
+		return;
+	if (caps && isalpha(c))
+		c ^= 0x20;			// caps inverts case, relative to shift
+	ring_push(c);
 }
- //////////////////////////////////////////////////////////////////////////////////////////////////
 
-//This function is called whenever the device is being written to from user space i.e.
-// data is sent to the device from the user. The data is copied to the message[] array in this
-/*
-filep:	 A pointer to a file object
-buffer:	 The buffer to that contains the string to write to the device
-len:	 	The length of the array of data that is being passed in the const char buffer
-offset:	 The offset if required
-*/
-
-static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset)
+static irqreturn_t kbd_isr(int irq, void *dev_id)
 {
-	sprintf(message, "%s(%d letters)", buffer, len);   // appending received string with its length
+	u8 status = inb(KBD_STATUS);
+	u8 sc;
 
-	size_of_message = strlen(message);                 // store the length of the stored message
+	if (!(status & 0x01))		// output buffer empty: not our interrupt
+		return IRQ_NONE;
 
-	printk(KERN_INFO "B :  Received %d characters from the user\n", len);
+	sc = inb(KBD_DATA);		// always drain, or the line keeps re-asserting
+	if (!(status & 0x20))		// bit 5 set => byte came from the aux/mouse port
+		kbd_decode(sc);
 
-	return len;
+	return IRQ_HANDLED;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////// 
-// The device release function that is called whenever the device is closed/released by the userspace program
-/*
-inodep:	 A pointer to an inode object (defined in linux/fs.h)
-filep:	 A pointer to a file object (defined in linux/fs.h)
-*/
-
-static int dev_release(struct inode *inodep, struct file *filep)
+static int kbd_open(struct inode *inode, struct file *filp)
 {
-	printk(KERN_INFO "B :  Device successfully closed\n");
-
+	pr_info("opened (%d)\n", atomic_inc_return(&opens));
 	return 0;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////// 
+static int kbd_release(struct inode *inode, struct file *filp)
+{
+	pr_info("closed\n");
+	return 0;
+}
 
-module_init(char_init);
-module_exit(char_exit);
+static ssize_t kbd_read(struct file *filp, char __user *ubuf, size_t len,
+			loff_t *off)
+{
+	char tmp[READ_MAX];
+	unsigned long flags;
+	size_t n = 0;
+
+	if (!len)
+		return 0;
+
+	for (;;) {
+		spin_lock_irqsave(&ring_lock, flags);
+		while (n < len && n < sizeof(tmp) && head != tail) {
+			tmp[n++] = ring[tail];
+			tail = (tail + 1) & (BUF_SIZE - 1);
+		}
+		spin_unlock_irqrestore(&ring_lock, flags);
+
+		if (n)
+			break;
+		// A concurrent reader may have drained the ring before we took
+		// the lock. Loop instead of returning 0 -- that reads as EOF.
+		if (filp->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		if (wait_event_interruptible(kbd_waitq, !ring_empty()))
+			return -ERESTARTSYS;
+	}
+
+	if (copy_to_user(ubuf, tmp, n))
+		return -EFAULT;
+
+	pr_debug("sent %zu char(s)\n", n);
+	return n;
+}
+
+static __poll_t kbd_poll(struct file *filp, poll_table *pt)
+{
+	poll_wait(filp, &kbd_waitq, pt);
+	return ring_empty() ? 0 : EPOLLIN | EPOLLRDNORM;
+}
+
+static const struct file_operations fops = {
+	.owner   = THIS_MODULE,
+	.open    = kbd_open,
+	.read    = kbd_read,
+	.poll    = kbd_poll,
+	.release = kbd_release,
+};
+
+// Undo everything init() set up. Only release ports we actually got.
+static void kbd_teardown(void)
+{
+	if (got_status)
+		release_region(KBD_STATUS, 1);
+	if (got_data)
+		release_region(KBD_DATA, 1);
+	device_destroy(kbd_class, MKDEV(major, 0));
+	class_destroy(kbd_class);	// also unregisters the class
+	unregister_chrdev(major, DEVICE_NAME);
+}
+
+static int __init kbd_init(void)
+{
+	struct device *dev;
+	int ret;
+
+	major = register_chrdev(0, DEVICE_NAME, &fops);
+	if (major < 0)
+		return major;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	kbd_class = class_create(DEVICE_NAME);
+#else
+	kbd_class = class_create(THIS_MODULE, DEVICE_NAME);
+#endif
+	if (IS_ERR(kbd_class)) {
+		unregister_chrdev(major, DEVICE_NAME);
+		return PTR_ERR(kbd_class);
+	}
+
+	dev = device_create(kbd_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
+	if (IS_ERR(dev)) {
+		class_destroy(kbd_class);
+		unregister_chrdev(major, DEVICE_NAME);
+		return PTR_ERR(dev);
+	}
+
+	// Bookkeeping only -- inb() works either way.
+	got_data   = request_region(KBD_DATA, 1, DEVICE_NAME) != NULL;
+	got_status = request_region(KBD_STATUS, 1, DEVICE_NAME) != NULL;
+	if (!got_data || !got_status)
+		pr_warn("could not reserve ports 0x%x/0x%x\n", KBD_DATA, KBD_STATUS);
+
+	ret = request_irq(KBD_IRQ, kbd_isr, 0, DEVICE_NAME, &kbd_isr);
+	if (ret) {
+		pr_alert("no IRQ %d (%d) -- unbind i8042 first: `make unbind`\n",
+			 KBD_IRQ, ret);
+		kbd_teardown();
+		return ret;
+	}
+
+	pr_info("ready on /dev/%s (major %d, IRQ %d)\n", DEVICE_NAME, major, KBD_IRQ);
+	return 0;
+}
+
+static void __exit kbd_exit(void)
+{
+	free_irq(KBD_IRQ, &kbd_isr);
+	kbd_teardown();
+	pr_info("unloaded -- run `make rebind` to restore i8042\n");
+}
+
+module_init(kbd_init);
+module_exit(kbd_exit);

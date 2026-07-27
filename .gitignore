@@ -1,0 +1,15 @@
+# kbuild output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+
+# userspace build output
+demo
+Character_Device_Driver/tests/decode_test
+Character_Device_Driver/tests/include/
+*.dSYM/

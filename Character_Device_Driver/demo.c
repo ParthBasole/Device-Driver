@@ -1,46 +1,40 @@
-#include<stdio.h>
-#include<stdlib.h>
-#include<errno.h>
-#include<fcntl.h>
-#include<string.h>
-#include<unistd.h>
-#define BUFFER_LENGTH 256          
-static char receive[BUFFER_LENGTH];     ///< The receive buffer from the LKM
+// demo.c - print keystrokes decoded by the ps2kbd driver. Ctrl-C to quit.
+//   make demo && sudo ./demo
 
-int main()
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#define DEVICE "/dev/ps2kbd"
+
+int main(void)
 {
-	int ret, fd;
-	char stringToSend[BUFFER_LENGTH];
-	printf("Starting device test code example...\n");
-	fd = open("/dev/Marvellous_Driver_1", O_RDWR);             // Open the device with read/write access
+	char buf[64];
+	int fd = open(DEVICE, O_RDONLY);
 
-	if (fd < 0)
-	{
-		perror("Failed to open the device...");
-		return errno;
+	if (fd < 0) {
+		perror("open " DEVICE);
+		return 1;
 	}
-	printf("Type in a short string to send to the kernel module:\n");
-	scanf("%[^\n]%*c", stringToSend);                // Read in a string (with spaces)
-	printf("Writing message to the device [%s].\n", stringToSend);
-	ret = write(fd, stringToSend, strlen(stringToSend)); // Send the string to the LKM
-	if (ret < 0)
-	{
-		perror("Failed to write the message to the device.");
-		return errno;
+	fputs("reading keystrokes (Ctrl-C to quit)...\n", stderr);
+
+	for (;;) {
+		ssize_t n = read(fd, buf, sizeof buf);
+
+		if (n == 0)		// driver stopped feeding us
+			break;
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("read");
+			close(fd);
+			return 1;
+		}
+		fwrite(buf, 1, n, stdout);
+		fflush(stdout);
 	}
 
-	printf("Press ENTER to read back from the device...\n");
-	getchar();
-
-	printf("Reading from the device...\n");
-	ret = read(fd, receive, BUFFER_LENGTH);        // Read the response from the LKM
-	if (ret < 0)
-	{
-		perror("Failed to read the message from the device.");
-		return errno;
-	}
-	printf("The received message is: [%s]\n", receive);
-	printf("End of the program\n");
-
+	close(fd);
 	return 0;
 }
